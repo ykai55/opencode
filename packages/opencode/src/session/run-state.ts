@@ -8,6 +8,7 @@ import { SessionStatus } from "./status"
 
 export interface Interface {
   readonly assertNotBusy: (sessionID: SessionID) => Effect.Effect<void, Session.BusyError>
+  readonly withBusy: <A, E, R>(sessionID: SessionID, work: Effect.Effect<A, E, R>) => Effect.Effect<A, E | Session.BusyError, R>
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly ensureRunning: (
     sessionID: SessionID,
@@ -33,6 +34,7 @@ export const layer = Layer.effect(
       Effect.fn("SessionRunState.state")(function* () {
         const scope = yield* Scope.Scope
         const runners = new Map<SessionID, Runner.Runner<MessageV2.WithParts>>()
+        const busy = new Set<SessionID>()
         yield* Effect.addFinalizer(
           Effect.fnUntraced(function* () {
             yield* Effect.forEach(runners.values(), (runner) => runner.cancel, {
@@ -40,9 +42,10 @@ export const layer = Layer.effect(
               discard: true,
             })
             runners.clear()
+            busy.clear()
           }),
         )
-        return { runners, scope }
+        return { runners, scope, busy }
       }),
     )
 
@@ -68,7 +71,26 @@ export const layer = Layer.effect(
     const assertNotBusy = Effect.fn("SessionRunState.assertNotBusy")(function* (sessionID: SessionID) {
       const data = yield* InstanceState.get(state)
       const existing = data.runners.get(sessionID)
-      if (existing?.busy) yield* busyError(sessionID)
+      if (existing?.busy || data.busy.has(sessionID)) yield* busyError(sessionID)
+    })
+
+    const withBusy = Effect.fn("SessionRunState.withBusy")(function* <A, E, R>(
+      sessionID: SessionID,
+      work: Effect.Effect<A, E, R>,
+    ) {
+      const data = yield* InstanceState.get(state)
+      const existing = data.runners.get(sessionID)
+      if (existing?.busy || data.busy.has(sessionID)) return yield* Effect.fail(busyError(sessionID))
+      data.busy.add(sessionID)
+      yield* status.set(sessionID, { type: "busy" })
+      return yield* work.pipe(
+        Effect.ensuring(
+          Effect.gen(function* () {
+            data.busy.delete(sessionID)
+            yield* status.set(sessionID, { type: "idle" })
+          }),
+        ),
+      )
     })
 
     const cancel = Effect.fn("SessionRunState.cancel")(function* (sessionID: SessionID) {
@@ -100,7 +122,7 @@ export const layer = Layer.effect(
         .pipe(Effect.catchTag("RunnerBusy", () => Effect.fail(busyError(sessionID))))
     })
 
-    return Service.of({ assertNotBusy, cancel, ensureRunning, startShell })
+    return Service.of({ assertNotBusy, withBusy, cancel, ensureRunning, startShell })
   }),
 )
 
